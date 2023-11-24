@@ -1,9 +1,9 @@
-options(repos = list(CRAN = "http://cran.rstudio.com/"))
-if(!require(ape, quietly = TRUE)) install.packages("ape"); library(ape)
-if(!require(stringi, quietly = TRUE)) install.packages("stringi"); library(stringi)
+#!/usr/bin/env Rscript
 
+library(ape)
+library(stringi)
 
-#### User parameters ####
+#### User options ####
 
 input <- commandArgs(TRUE) # pass bash input to R
 prefix <- "refseq" # output file prefix
@@ -11,7 +11,12 @@ seq_meta <- "refseq_genomes_meta.tsv" # sequence metadata
 
 window.size <- 5000 # sliding window size (default 5 kb)
 window.step <- 1000 # sliding window step size (default 1 kb)
-subsample <- FALSE # default FALSE
+# if you don't wish to use sliding windows, make the window and step sizes arbitrarily large
+
+rm_plasmids <- TRUE # exclude plasmids due to uncharacteristic ONFs? (default FALSE)
+cat_contigs <- TRUE # concatenate contigs into a single, long sequence? (default FALSE)
+subsample <- 45 # subsample sliding windows? (default FALSE)
+rand_seed <- 4444 # set random seed for reproducibility if subsampling (default 4444)
 
 k <- 4 # choose kmer length (default 4)
 kmers <- expand.grid(rep(list(c("a","c","g","t")), k), stringsAsFactors = FALSE)
@@ -41,34 +46,43 @@ write.table(matrix(c("",kmers), nrow = 1), paste0(prefix,"_ONF_matrix.tsv"), sep
 for(i in 1:length(files)){
   f <- files[i]
   print(paste0("(",i,"/",length(files),") Working on ",f))
-  fasta <- read.dna(gzfile(f), format = "fasta", as.character = TRUE, as.matrix = FALSE)
-  fasta.sub <- fasta[!(grepl("plasmid", names(fasta)))] # exclude plasmids due to uncharacteristic ONFs
-  fasta.cat <- paste(sapply(fasta.sub, FUN = paste, collapse = ""), collapse = strrep("n",k))
-  # concatenate contig sequences into a single, long string separated by k undetermined (n) bases
-  
-  # determine the number of sliding windows in concatenated sequence
-  n.window <- max(1, round((nchar(fasta.cat)-window.size)/window.step) + 1)
-  # if the final window is shorter by more than half of step size, discard it entirely
+  # read sequence file (fasta format)
+  fasta <- read.dna(f, format = "fasta", as.character = TRUE, as.matrix = FALSE)
+  # exclude contigs with sequence headers containing the word "plasmid" (optional)
+  if(rm_plasmids) fasta <- fasta[!grepl("plasmid", names(fasta), ignore.case = TRUE)]
+  fasta.cat <- sapply(fasta, FUN = paste, collapse = "")
+  # concatenate contigs into a single, long string separated by k undetermined (n) bases (optional)
+  if(cat_contigs) fasta.cat <- paste(fasta.cat, collapse = strrep("n",k))
+  # rename contigs using the format path:`/full/local/path`.contig:`contig name`
+  names(fasta.cat) <- paste0("path:`",f,"`.contig:`",names(fasta.cat),"`")
   
   # generate sliding windows
-  seqs <- sapply(1:n.window, FUN = function(i){
-    substr(fasta.cat, (i-1)*window.step+1, (i-1)*window.step+window.size)
+  seqs <- lapply(fasta.cat, function(contig){
+    # determine the number of sliding windows in each contig
+    n.window <- max(1, round((nchar(contig)-window.size)/window.step) + 1)
+    # if the final window is shorter by more than half of step size, discard it entirely
+    windows <- sapply(1:n.window, FUN = function(i){
+      substr(contig, (i-1)*window.step+1, (i-1)*window.step+window.size)
+    })
+    # rename windows using the format start:int.end:int
+    names(windows) <- paste0("start:",as.integer((1:n.window-1)*window.step+1),
+                             ".end:",as.integer((1:n.window-1)*window.step+window.size))
+    # discard sliding windows with > 10% undermined (n) bases
+    windows <- windows[stri_count_fixed(windows, "n") < sapply(windows, nchar)*0.1]
+    # in some cases, it may be necessary to subsample due to memory/time limitations for downstream steps
+    if(is.numeric(subsample) && subsample < length(windows)){
+      windows <- windows[sort(sample(1:length(windows), subsample))]
+    }
+    return(windows)
   })
-  # discard sliding windows with > 10% undermined (n) bases
-  seqs <- seqs[stri_count_fixed(seqs, "n") < window.size*0.1]
-  if(length(seqs) == 0) next
-  # in some cases, it will be necessary to subsample due to memory/time limitations for downstream steps
-  if(is.numeric(subsample) && subsample < length(seqs)) seqs <- sample(seqs, subsample)
   
   # calculate oligonucleotide frequencies for each sliding window
-  onf.matrix <- t(sapply(seqs, FUN = function(seq){
-    onf <- sapply(kmers, FUN = stri_count_fixed, str = seq, overlap = TRUE) # count kmers
-    onf/sum(onf) # normalize kmer counts
-  }, USE.NAMES = FALSE))
-
+  onf.matrix <- t(sapply(unlist(seqs), FUN = stri_count, fixed = kmers, overlap = TRUE))
+  onf.matrix <- onf.matrix/sum(onf.matrix) # normalize kmer counts
+  
   # output kmer counts to `ONF_matrix.tsv`
   write.table(onf.matrix, file = paste0(prefix,"_ONF_matrix.tsv"), append = TRUE, sep = "\t",
-              quote = FALSE, row.names = paste0(f,"_",1:length(seqs)), col.names = FALSE)
+              quote = FALSE, row.names = TRUE, col.names = FALSE)
 }
 
 # Read full ONF matrix and save as RDS file
