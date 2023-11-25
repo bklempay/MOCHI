@@ -3,49 +3,57 @@
 library(ape)
 library(stringi)
 
-#### User options ####
+#### Default options ####
 
-input <- commandArgs(TRUE) # pass bash input to R
-prefix <- "refseq" # output file prefix
-seq_meta <- "refseq_genomes_meta.tsv" # sequence metadata
-
+prefix <- "mochi" # output file prefix
+k <- 4 # choose kmer length (default 4)
 window.size <- 5000 # sliding window size (default 5 kb)
 window.step <- 1000 # sliding window step size (default 1 kb)
 # if you don't wish to use sliding windows, make the window and step sizes arbitrarily large
-
-rm_plasmids <- TRUE # exclude plasmids due to uncharacteristic ONFs? (default FALSE)
-cat_contigs <- TRUE # concatenate contigs into a single, long sequence? (default FALSE)
-subsample <- 45 # subsample sliding windows? (default FALSE)
+rm_plasmids <- FALSE # exclude plasmids due to uncharacteristic ONFs? (default FALSE)
+cat_contigs <- FALSE # concatenate contigs into a single, long sequence? (default FALSE)
+subsample <- FALSE # subsample sliding windows? (default FALSE)
 rand_seed <- 4444 # set random seed for reproducibility if subsampling (default 4444)
 
-k <- 4 # choose kmer length (default 4)
-kmers <- expand.grid(rep(list(c("a","c","g","t")), k), stringsAsFactors = FALSE)
-kmers <- apply(kmers, MARGIN = 1, FUN = paste, collapse = "")
+
+#### Command line arguments ####
+
+input <- commandArgs(TRUE) # pass command line arguments to R
+files <- character(0) # empty vector to append sequence files
+
+# Parse command line input
+for(arg in input){
+  if(grepl("=", arg)){
+    arg <- unlist(strsplit(arg, "=")) # split argument into variable name (arg[1]) and value (arg[2])
+    if(!(arg[1] %in% ls())) stop(paste0("invalid command line argument (",arg[1],")")) # flag invalid arguments
+    assign(arg[1], arg[2]) # if there are multiple equal signs, everything after the second will be disregarded
+    if(grepl("^\\d+$", arg[2])) assign(arg[1], as.numeric(arg[2])) # convert to numeric if possible
+  } else files <- c(files, arg)
+}
 
 # Careful not to accidentally overwrite anything!
-if(paste0(prefix,"_ONF_matrix.rds") %in% list.files()) stop(paste0(prefix,"_ONF_matrix.tsv already exists"))
+if(paste0(prefix,"_ONF_matrix.tsv") %in% list.files()) stop(paste0(prefix,"_ONF_matrix.tsv already exists"))
+if(paste0(prefix,"_ONF_matrix.rds") %in% list.files()) stop(paste0(prefix,"_ONF_matrix.rds already exists"))
 if(paste0(prefix,"_ONF_dgen.rds") %in% list.files()) stop(paste0(prefix,"_ONF_dgen.rds already exists"))
 
 
-#### Get sequence metadata ####
-
-# Read tab-separated sequence metadata file (assume headers in line 1). You can create a metadata file
-# in the correct format using `get_meta.R`. At a minimum, must contain a column named `local_path` with
-# the full path to each sequence file. Sequence files must be in gzipped fasta format!
-meta <- read.delim(seq_meta, quote = "", comment.char = "")
-files <- meta$local_path
-
-
 #### Calculate oligonucleotide frequencies ####
+
+# Generate possible kmers
+kmers <- expand.grid(rep(list(c("a","c","g","t")), k), stringsAsFactors = FALSE)
+kmers <- apply(kmers, MARGIN = 1, FUN = paste, collapse = "")
 
 # Create output file
 write.table(matrix(c("",kmers), nrow = 1), paste0(prefix,"_ONF_matrix.tsv"), sep = "\t",
             quote = FALSE, row.names = FALSE, col.names = FALSE)
 
-# Run for loop on all sequence files... this could and should be done in parallel for large data sets
+# Set random seed (recommended if subsampling)
+if(is.numeric(rand_seed)) set.seed(rand_seed)
+
+# Run for loop on all sequence files... this could and should be done in parallel for large datasets
 for(i in 1:length(files)){
   f <- files[i]
-  print(paste0("(",i,"/",length(files),") Working on ",f))
+  cat("(",i,"/",length(files),") Working on ",f,"\n", sep = "")
   # read sequence file (fasta format)
   fasta <- read.dna(f, format = "fasta", as.character = TRUE, as.matrix = FALSE)
   # exclude contigs with sequence headers containing the word "plasmid" (optional)
