@@ -6,14 +6,15 @@ library(stringi)
 #### Default options ####
 
 prefix <- "mochi" # output file prefix
+format <- "tsv" # output file format ["tsv"|"rds"]
 k <- 4 # choose kmer length (default 4)
-window.size <- 5000 # sliding window size (default 5 kb)
-window.step <- 1000 # sliding window step size (default 1 kb)
+window_size <- 5000 # sliding window size (default 5 kb)
+window_step <- 1000 # sliding window step size (default 1 kb)
 # if you don't wish to use sliding windows, make the window and step sizes arbitrarily large
-rm_plasmids <- FALSE # exclude plasmids due to uncharacteristic ONFs? (default FALSE)
-cat_contigs <- FALSE # concatenate contigs into a single, long sequence? (default FALSE)
-subsample <- FALSE # subsample sliding windows? (default FALSE)
-rand_seed <- 4444 # set random seed for reproducibility if subsampling (default 4444)
+rm_plasmids <- FALSE # exclude plasmids due to uncharacteristic ONFs?
+cat_contigs <- FALSE # concatenate contigs into a single, long sequence?
+subsample <- FALSE # subsample sliding windows? [integer]
+rand_seed <- 4444 # set random seed for reproducibility if subsampling
 
 
 #### Command line arguments ####
@@ -30,11 +31,9 @@ for(arg in input){
     if(grepl("^\\d+$", arg[2])) assign(arg[1], as.numeric(arg[2])) # convert to numeric if possible
   } else files <- c(files, arg)
 }
-
-# Careful not to accidentally overwrite anything!
-if(paste0(prefix,"_ONF_matrix.tsv") %in% list.files()) stop(paste0(prefix,"_ONF_matrix.tsv already exists"))
-if(paste0(prefix,"_ONF_matrix.rds") %in% list.files()) stop(paste0(prefix,"_ONF_matrix.rds already exists"))
-if(paste0(prefix,"_ONF_dgen.rds") %in% list.files()) stop(paste0(prefix,"_ONF_dgen.rds already exists"))
+stopifnot(file.exists(files),
+          grepl("\\.(fasta|fas|fa|fna|ffn)", files, ignore.case = TRUE),
+          format %in% c("tsv","rds"))
 
 
 #### Calculate oligonucleotide frequencies ####
@@ -44,11 +43,14 @@ kmers <- expand.grid(rep(list(c("a","c","g","t")), k), stringsAsFactors = FALSE)
 kmers <- apply(kmers, MARGIN = 1, FUN = paste, collapse = "")
 
 # Create output file
+if(file.exists(paste0(prefix,"_ONF_matrix.tsv"))) stop(paste0(prefix,"_ONF_matrix.tsv already exists"))
 write.table(matrix(c("",kmers), nrow = 1), paste0(prefix,"_ONF_matrix.tsv"), sep = "\t",
             quote = FALSE, row.names = FALSE, col.names = FALSE)
 
 # Set random seed (recommended if subsampling)
-if(is.numeric(rand_seed)) set.seed(rand_seed)
+if(rand_seed) set.seed(rand_seed)
+
+cat("Calculating oligonucleotide frequencies...\n")
 
 # Run for loop on all sequence files... this could and should be done in parallel for large datasets
 for(i in 1:length(files)){
@@ -67,38 +69,36 @@ for(i in 1:length(files)){
   # generate sliding windows
   seqs <- lapply(fasta.cat, function(contig){
     # determine the number of sliding windows in each contig
-    n.window <- max(1, round((nchar(contig)-window.size)/window.step) + 1)
+    n.window <- max(1, round((nchar(contig)-window_size)/window_step) + 1)
     # if the final window is shorter by more than half of step size, discard it entirely
     windows <- sapply(1:n.window, FUN = function(i){
-      substr(contig, (i-1)*window.step+1, (i-1)*window.step+window.size)
+      substr(contig, (i-1)*window_step+1, (i-1)*window_step+window_size)
     })
     # rename windows using the format start:int.end:int
-    names(windows) <- paste0("start:",as.integer((1:n.window-1)*window.step+1),
-                             ".end:",as.integer((1:n.window-1)*window.step+window.size))
+    names(windows) <- paste0("start:[",as.integer((1:n.window-1)*window_step+1),
+                             "].end:[",as.integer((1:n.window-1)*window_step+window_size),"]")
     # discard sliding windows with > 10% undermined (n) bases
     windows <- windows[stri_count_fixed(windows, "n") < sapply(windows, nchar)*0.1]
     # in some cases, it may be necessary to subsample due to memory/time limitations for downstream steps
-    if(is.numeric(subsample) && subsample < length(windows)){
-      windows <- windows[sort(sample(1:length(windows), subsample))]
-    }
+    if(subsample && subsample < length(windows)) windows <- windows[sort(sample(1:length(windows), subsample))]
     return(windows)
   })
   
   # calculate oligonucleotide frequencies for each sliding window
   onf.matrix <- t(sapply(unlist(seqs), FUN = stri_count, fixed = kmers, overlap = TRUE))
-  onf.matrix <- onf.matrix/sum(onf.matrix) # normalize kmer counts
+  onf.matrix <- onf.matrix/rowSums(onf.matrix) # normalize kmer counts
   
   # output kmer counts to `ONF_matrix.tsv`
-  write.table(onf.matrix, file = paste0(prefix,"_ONF_matrix.tsv"), append = TRUE, sep = "\t",
+  write.table(onf.matrix, paste0(prefix,"_ONF_matrix.tsv"), append = TRUE, sep = "\t",
               quote = FALSE, row.names = TRUE, col.names = FALSE)
 }
 
-# Read full ONF matrix and save as RDS file
-onf.full <- data.matrix(read.delim(paste0(prefix,"_ONF_matrix.tsv"), row.names = 1))
-saveRDS(onf.full, paste0(prefix,"_ONF_matrix.rds"))
-
 
 #### Calculate degenerated oligonucleotide frequencies ####
+
+# Read full ONF matrix
+onf.full <- data.matrix(read.delim(paste0(prefix,"_ONF_matrix.tsv"), row.names = 1))
+if(format == "rds") saveRDS(onf.full, paste0(prefix,"_ONF_matrix.rds"))
 
 # Find column indices of reverse complement for each kmer
 dgen.key <- stri_replace_all(kmers, fixed = c("a","c","g","t"), c("T","G","C","A"), vectorize_all = FALSE)
@@ -108,9 +108,10 @@ cols2sum <- dgen.key > 1:length(kmers)
 cols2del <- dgen.key < 1:length(kmers)
 
 onf.dgen <- onf.full
-onf.dgen[,cols2sum] <-  onf.dgen[,cols2sum] + onf.dgen[,dgen.key[cols2sum]] # sum kmers + reverse complements
+onf.dgen[,cols2sum] <- onf.dgen[,cols2sum] + onf.dgen[,dgen.key[cols2sum]] # sum kmers + reverse complements
 onf.dgen <- onf.dgen[,!cols2del] # remove reverse complements from matrix
 # do nothing to kmers that are their own reverse complement
 
-# Save degenerated ONF matrix as RDS file
-saveRDS(onf.dgen, paste0(prefix,"_ONF_dgen.rds"))
+# Save degenerated ONF matrix
+if(format == "tsv") write.table(onf.dgen, paste0(prefix,"_ONF_dgen.tsv"), sep = "\t", quote = FALSE)
+if(format == "rds") saveRDS(onf.dgen, paste0(prefix,"_ONF_dgen.rds"))
