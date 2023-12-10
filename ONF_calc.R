@@ -5,6 +5,7 @@ library(stringi)
 
 #### Default options ####
 
+outdir <- "."         # output file directory
 prefix <- "mochi"     # output file prefix
 format <- "rds"       # output file format ["rds"|"tsv"]
 k <- 4                # kmer length
@@ -12,6 +13,7 @@ window_size <- 5000   # sliding window dimensions (to bypass sliding windows,
 window_step <- 1000   # make the window and step sizes arbitrarily large)
 rm_plasmids <- FALSE  # exclude plasmids due to uncharacteristic ONFs?
 cat_contigs <- FALSE  # concatenate contigs into a single, long sequence?
+min_length <- TRUE    # minimum contig length? (default 0.9 * window_size)
 subsample <- FALSE    # subsample sliding windows? [integer]
 rand_seed <- 4444     # set random seed for reproducibility if subsampling
 
@@ -36,27 +38,40 @@ for (arg in input) {
     # assign value to variable name
     assign(arg[1], arg[2])
     # convert values to numeric if possible
-    if (grepl("^\\d+$", arg[2])) assign(arg[1], as.numeric(arg[2]))
+    if (grepl("^\\d*\\.?\\d+$", arg[2])) assign(arg[1], as.numeric(arg[2]))
   }
 }
 
-stopifnot(file.exists(files), 
-          grepl("\\.(fasta|fas|fa|fna|ffn)", files, ignore.case = TRUE), 
-          format %in% c("rds", "tsv"))
+# Create output file directory (if it doesn't already exist)
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+# append output file directory to prefix
+prefix <- paste0(outdir, "/", prefix)
+
+# By default, minimum contig length equals 0.9 * window_size
+if(min_length == TRUE) min_length <- 0.9 * window_size
+
+stopifnot(
+  file.exists(files), 
+  grepl("\\.(fasta|fas|fa|fna|ffn)(\\.gz)?$", files, ignore.case = TRUE),
+  format %in% c("rds", "tsv"),
+  is.numeric(c(k, window_size, window_step)),
+  is.logical(c(rm_plasmids, cat_contigs)),
+  class(c(min_length, subsample, rand_seed)) %in% c("numeric","logical")
+)
 
 
 #### Calculate oligonucleotide frequencies ####
 
 # Generate possible kmers
-kmers <- expand.grid(rep(list(c("a", "c", "g", "t")), k),
+kmers <- expand.grid(rep(list(c("a", "t", "c", "g")), k),
                      stringsAsFactors = FALSE)
 kmers <- apply(kmers, 1, paste, collapse = "")
 
 # Create output file
-if (file.exists(paste0(prefix, "_ONF_matrix.tsv"))) {
-  stop(prefix, "_ONF_matrix.tsv already exists")
+if (file.exists(paste0(prefix, "_ONF_calc.tsv"))) {
+  stop(prefix, "_ONF_calc.tsv already exists")
 }
-write.table(matrix(c("", kmers), nrow = 1), paste0(prefix, "_ONF_matrix.tsv"),
+write.table(matrix(c("", kmers), nrow = 1), paste0(prefix, "_ONF_calc.tsv"),
             sep = "\t", 
             quote = FALSE,
             row.names = FALSE,
@@ -83,8 +98,10 @@ for (i in 1:length(files)) {
   # concatenate contigs into a single, long string (optional)
   # separated by k undetermined (n) bases
   if (cat_contigs) fasta.cat <- paste(fasta.cat, collapse = strrep("n", k))
-  # rename contigs using the format path:</full/local/path>.contig:<contig name>
-  names(fasta.cat) <- paste0("path:<", f, ">.contig:<", names(fasta.cat), ">")
+  # discard contigs shorter than minimum length (optional)
+  if (min_length) fasta.cat <- fasta.cat[nchar(fasta.cat) >= min_length]
+  # rename contigs using the format path:'/full/local/path'_contig:'contig name'
+  names(fasta.cat) <- paste0("path:'", f, "'_contig:'", names(fasta.cat), "'")
   
   # Generate sliding windows
   seqs <- lapply(fasta.cat, function(contig) {
@@ -99,9 +116,9 @@ for (i in 1:length(files)) {
                       x = contig,
                       start = window.pos$start,
                       stop = window.pos$end)
-    # rename windows using the format start:<int>.end:<int>
-    names(windows) <- paste0("start:<", as.integer(window.pos$start),
-                             ">.end:<", as.integer(window.pos$end), ">")
+    # rename windows using the format start:[int]_end:[int]
+    names(windows) <- paste0("start:", as.integer(window.pos$start),
+                             "_end:", as.integer(window.pos$end))
     # discard sliding windows with > 10% undermined (n) bases
     n.percent <- stri_count_fixed(windows, "n") / sapply(windows, nchar)
     windows <- windows[n.percent <= 0.1]
@@ -114,10 +131,14 @@ for (i in 1:length(files)) {
   
   # Calculate oligonucleotide frequencies for each sliding window
   onf <- t(sapply(unlist(seqs), stri_count, fixed = kmers, overlap = TRUE))
-  onf <- onf/rowSums(onf) # normalize kmer counts
+  onf <- onf / rowSums(onf) # normalize kmer counts
   
-  # Output kmer counts to `ONF_matrix.tsv`
-  write.table(onf, paste0(prefix, "_ONF_matrix.tsv"),
+  # Update sliding window names to the format:
+  # path:'/full/local/path'_contig:'contig name'_start:[int]_end:[int]
+  rownames(onf) <- gsub("'.start", "'_start", rownames(onf))
+  
+  # Output kmer counts to 'ONF_calc.tsv'
+  write.table(onf, paste0(prefix, "_ONF_calc.tsv"),
               append = TRUE,
               sep = "\t", 
               quote = FALSE,
@@ -129,15 +150,15 @@ for (i in 1:length(files)) {
 #### Calculate degenerated oligonucleotide frequencies ####
 
 # Read full ONF matrix
-onf.matrix <- data.matrix(
-  read.delim(paste0(prefix, "_ONF_matrix.tsv"), row.names = 1)
+onf.calc <- data.matrix(
+  read.delim(paste0(prefix, "_ONF_calc.tsv"), row.names = 1)
 )
-if (format == "rds") saveRDS(onf.matrix, paste0(prefix, "_ONF_matrix.rds"))
+if (format == "rds") saveRDS(onf.calc, paste0(prefix, "_ONF_calc.rds"))
 
 # Find column indices of reverse complement for each kmer
 dgen.key <- stri_replace_all(kmers,
-                             fixed = c("a", "c", "g", "t"),
-                             replacement = c("T", "G", "C", "A"),
+                             fixed = c("a", "t", "c", "g"),
+                             replacement = c("T", "A", "G", "C"),
                              vectorize_all = FALSE)
 dgen.key <- stri_reverse(tolower(dgen.key))
 dgen.key <- match(dgen.key, kmers)
@@ -145,7 +166,7 @@ cols2sum <- dgen.key > 1:length(kmers)
 cols2del <- dgen.key < 1:length(kmers)
 
 # Combine reverse complement kmers
-onf.dgen <- onf.matrix
+onf.dgen <- onf.calc
 # sum kmers + reverse complements
 onf.dgen[, cols2sum] <- onf.dgen[, cols2sum] + onf.dgen[, dgen.key[cols2sum]]
 # remove reverse complements from matrix

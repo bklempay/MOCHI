@@ -6,6 +6,7 @@ library(parallel)
 
 #### Default options ####
 
+outdir <- "."         # output file directory
 prefix <- "mochi"     # output file prefix
 format <- "rds"       # output file format ["rds"|"tsv"]
 k <- 4                # kmer length
@@ -13,6 +14,7 @@ window_size <- 5000   # sliding window dimensions (to bypass sliding windows,
 window_step <- 1000   # make the window and step sizes arbitrarily large)
 rm_plasmids <- FALSE  # exclude plasmids due to uncharacteristic ONFs?
 cat_contigs <- FALSE  # concatenate contigs into a single, long sequence?
+min_length <- TRUE    # minimum contig length? (default 0.9 * window_size)
 subsample <- FALSE    # subsample sliding windows? [integer]
 rand_seed <- 4444     # set random seed for reproducibility if subsampling
 nthreads <- detectCores() # default all available cores
@@ -38,34 +40,44 @@ for (arg in input) {
     # assign value to variable name
     assign(arg[1], arg[2])
     # convert values to numeric if possible
-    if (grepl("^\\d+$", arg[2])) assign(arg[1], as.numeric(arg[2]))
+    if (grepl("^\\d*\\.?\\d+$", arg[2])) assign(arg[1], as.numeric(arg[2]))
   }
 }
 
-stopifnot(file.exists(files), 
-          grepl("\\.(fasta|fas|fa|fna|ffn)", files, ignore.case = TRUE), 
-          format %in% c("rds", "tsv"))
+# Create output file directory (if it doesn't already exist)
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+# append output file directory to prefix
+prefix <- paste0(outdir, "/", prefix)
+
+# By default, minimum contig length equals 0.9 * window_size
+if(min_length == TRUE) min_length <- 0.9 * window_size
+
+stopifnot(
+  file.exists(files), 
+  grepl("\\.(fasta|fas|fa|fna|ffn)(\\.gz)?$", files, ignore.case = TRUE),
+  format %in% c("rds", "tsv"),
+  is.numeric(c(k, window_size, window_step, nthreads)),
+  is.logical(c(rm_plasmids, cat_contigs)),
+  class(c(min_length, subsample, rand_seed)) %in% c("numeric","logical")
+)
 
 
 #### Calculate oligonucleotide frequencies ####
 
 # Generate possible kmers
-kmers <- expand.grid(rep(list(c("a", "c", "g", "t")), k),
+kmers <- expand.grid(rep(list(c("a", "t", "c", "g")), k),
                      stringsAsFactors = FALSE)
 kmers <- apply(kmers, 1, paste, collapse = "")
 
 # Create parallel socket cluster
 clust <- makeCluster(nthreads)
-clusterExport(clust, c("window_size", "window_step", "rm_plasmids",
-                       "cat_contigs", "subsample", "k", "kmers"))
-
-# Set random seed (recommended if subsampling)
-if (rand_seed) clusterSetRNGStream(clust, rand_seed)
+clusterExport(clust, c("k", "window_size", "window_step", "rm_plasmids",
+                       "cat_contigs", "min_length", "subsample", "kmers"))
 
 cat("Generating sliding windows...\n")
 
 # Run all sequence files in parallel
-seqs <- parLapply(clust, files, function(f) {
+seqs <- parLapplyLB(clust, files, function(f) {
   # read sequence file (fasta format)
   fasta <- ape::read.dna(f,
                          format = "fasta",
@@ -80,8 +92,10 @@ seqs <- parLapply(clust, files, function(f) {
   # concatenate contigs into a single, long string (optional)
   # separated by k undetermined (n) bases
   if (cat_contigs) fasta.cat <- paste(fasta.cat, collapse = strrep("n", k))
-  # rename contigs using the format path:</full/local/path>.contig:<contig name>
-  names(fasta.cat) <- paste0("path:<", f, ">.contig:<", names(fasta.cat), ">")
+  # discard contigs shorter than minimum length (optional)
+  if (min_length) fasta.cat <- fasta.cat[nchar(fasta.cat) >= min_length]
+  # rename contigs using the format path:'/full/local/path'_contig:'contig name'
+  names(fasta.cat) <- paste0("path:'", f, "'_contig:'", names(fasta.cat), "'")
   
   # Generate sliding windows
   lapply(fasta.cat, function(contig) {
@@ -96,35 +110,50 @@ seqs <- parLapply(clust, files, function(f) {
                       x = contig,
                       start = window.pos$start,
                       stop = window.pos$end)
-    # rename windows using the format start:<int>.end:<int>
-    names(windows) <- paste0("start:<", as.integer(window.pos$start),
-                             ">.end:<", as.integer(window.pos$end), ">")
+    # rename windows using the format start:[int]_end:[int]
+    names(windows) <- paste0("start:", as.integer(window.pos$start),
+                             "_end:", as.integer(window.pos$end))
     # discard sliding windows with > 10% undermined (n) bases
-    n.percent <- stri_count_fixed(windows, "n") / sapply(windows, nchar)
+    n.percent <- stringi::stri_count_fixed(windows, "n") / nchar(windows)
     windows <- windows[n.percent <= 0.1]
-    # subsample due to memory/time limitations for downstream steps (optional)
-    if (subsample && subsample < length(windows)) {
-      windows <- windows[sort(sample(1:length(windows), subsample))]
-    }
+
     return(windows)
   })
 })
 
+# Subsample due to memory/time limitations for downstream steps (optional)
+if (subsample) {
+  # set random seed (recommended if subsampling)
+  if (rand_seed) clusterSetRNGStream(clust, rand_seed)
+  seqs <- parLapply(clust, seqs, function(contigs) {
+    lapply(contigs, function(windows) {
+      if (subsample < length(windows)) {
+        windows <- windows[sort(sample(1:length(windows), subsample))]
+      }
+      return(windows)
+    })
+  })
+}
+
 cat("Calculating oligonucleotide frequencies...\n")
 
 # Calculate oligonucleotide frequencies for each sliding window
-onf.matrix <- t(parSapplyLB(clust, unlist(seqs), stringi::stri_count,
-                            fixed = kmers,
-                            overlap = TRUE))
-onf.matrix <- onf.matrix/rowSums(onf.matrix) # normalize kmer counts
-colnames(onf.matrix) <- kmers
+onf.calc <- t(parSapplyLB(clust, unlist(seqs), stringi::stri_count,
+                          fixed = kmers,
+                          overlap = TRUE))
+onf.calc <- onf.calc / rowSums(onf.calc) # normalize kmer counts
+colnames(onf.calc) <- kmers
 
 stopCluster(clust)
 
+# Update sliding window names to the format:
+# path:'/full/local/path'_contig:'contig name'_start:[int]_end:[int]
+rownames(onf.calc) <- gsub("'.start", "'_start", rownames(onf.calc))
+
 # Save ONF matrix
 switch(format,
-       rds = saveRDS(onf.matrix, paste0(prefix, "_ONF_matrix.rds")),
-       tsv = write.table(onf.matrix, paste0(prefix, "_ONF_matrix.tsv"),
+       rds = saveRDS(onf.calc, paste0(prefix, "_ONF_calc.rds")),
+       tsv = write.table(onf.calc, paste0(prefix, "_ONF_calc.tsv"),
                          sep = "\t",
                          quote = FALSE))
 
@@ -133,8 +162,8 @@ switch(format,
 
 # Find column indices of reverse complement for each kmer
 dgen.key <- stri_replace_all(kmers,
-                             fixed = c("a", "c", "g", "t"),
-                             replacement = c("T", "G", "C", "A"),
+                             fixed = c("a", "t", "c", "g"),
+                             replacement = c("T", "A", "G", "C"),
                              vectorize_all = FALSE)
 dgen.key <- stri_reverse(tolower(dgen.key))
 dgen.key <- match(dgen.key, kmers)
@@ -142,7 +171,7 @@ cols2sum <- dgen.key > 1:length(kmers)
 cols2del <- dgen.key < 1:length(kmers)
 
 # Combine reverse complement kmers
-onf.dgen <- onf.matrix
+onf.dgen <- onf.calc
 # sum kmers + reverse complements
 onf.dgen[, cols2sum] <- onf.dgen[, cols2sum] + onf.dgen[, dgen.key[cols2sum]]
 # remove reverse complements from matrix
