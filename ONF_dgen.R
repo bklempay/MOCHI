@@ -12,17 +12,17 @@ for (f in files) {
   }
   
   # Read raw oligonucleotide frequency matrix (e.g. output of `ONF_calc.R`)
-  if (grepl("\\.rds$", f, ignore.case = TRUE)) onf.matrix <- readRDS(f)
+  if (grepl("\\.rds$", f, ignore.case = TRUE)) onf <- readRDS(f)
   if (grepl("\\.tsv$", f, ignore.case = TRUE)) {
-    onf.matrix <- data.matrix(read.delim(f, row.names = 1))
+    onf <- data.matrix(read.delim(f, row.names = 1))
     # assumes row names in first column
   }
   
   # Find column indices of reverse complement for each kmer
-  kmers <- tolower(colnames(onf.matrix))
+  kmers <- tolower(colnames(onf))
   dgen.key <- stri_replace_all(kmers,
-                               fixed = c("a", "c", "g", "t"),
-                               replacement = c("T", "G", "C", "A"),
+                               fixed = c("a", "t", "c", "g"),
+                               replacement = c("T", "A", "G", "C"),
                                vectorize_all = FALSE)
   dgen.key <- stri_reverse(tolower(dgen.key))
   dgen.key <- match(dgen.key, kmers)
@@ -30,7 +30,7 @@ for (f in files) {
   cols2del <- dgen.key < 1:length(kmers)
   
   # Combine reverse complement kmers
-  onf.dgen <- onf.matrix
+  onf.dgen <- onf
   # sum kmers + reverse complements
   onf.dgen[, cols2sum] <- onf.dgen[, cols2sum] + onf.dgen[, dgen.key[cols2sum]]
   # remove reverse complements from matrix
