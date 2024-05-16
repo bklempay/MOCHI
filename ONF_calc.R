@@ -37,10 +37,21 @@ for (arg in input) {
     }
     # assign value to variable name
     assign(arg[1], arg[2])
-    # convert values to numeric if possible
-    if (grepl("^\\d*\\.?\\d+$", arg[2])) assign(arg[1], as.numeric(arg[2]))
   }
 }
+
+# Convert variables to numeric/integer/logical as appropriate
+for (var in ls()) assign(var, type.convert(get(var), as.is = TRUE))
+
+# Check for illegal user input
+stopifnot(
+  file.exists(files),
+  grepl("\\.(fasta|fas|fa|fna|ffn)(\\.gz)?$", files, ignore.case = TRUE),
+  format %in% c("rds", "tsv"),
+  is.integer(c(k, window_size, window_step)),
+  is.logical(c(rm_plasmids, cat_contigs)),
+  class(c(min_length, subsample, rand_seed)) %in% c("integer", "logical")
+)
 
 # Create output file directory (if it doesn't already exist)
 if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
@@ -50,21 +61,11 @@ prefix <- paste0(outdir, "/", prefix)
 # By default, minimum contig length equals 0.9 * window_size
 if(min_length == TRUE) min_length <- 0.9 * window_size
 
-stopifnot(
-  file.exists(files), 
-  grepl("\\.(fasta|fas|fa|fna|ffn)(\\.gz)?$", files, ignore.case = TRUE),
-  format %in% c("rds", "tsv"),
-  is.numeric(c(k, window_size, window_step)),
-  is.logical(c(rm_plasmids, cat_contigs)),
-  class(c(min_length, subsample, rand_seed)) %in% c("numeric","logical")
-)
-
 
 #### Calculate oligonucleotide frequencies ####
 
 # Generate possible kmers
-kmers <- expand.grid(rep(list(c("a", "t", "c", "g")), k),
-                     stringsAsFactors = FALSE)
+kmers <- expand.grid(rep(list(c("a", "t", "c", "g")), k))
 kmers <- apply(kmers, 1, paste, collapse = "")
 
 # Create output file
