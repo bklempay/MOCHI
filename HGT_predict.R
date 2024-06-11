@@ -92,8 +92,8 @@ onf.mode <- lapply(onf.data, function(onf) {
   # kmer counts can be modeled as a Poisson distribution, though the tails will
   # be slightly fatter due to non-independence of overlapping sliding windows.
   # Determine the log-likelihood of each sliding window as if the true null ONF
-  # distribution were the composite of independent Poisson-distributed kmers.
-  # (this is not actually the case, but it's a good place to start)
+  # distribution were the composite of independent, Poisson-distributed kmers
+  # (not the case, but it's a good way to rank distance from the ONF mode).
   kmer.loglik <- apply(onf, 2, function(kmer) {
     kmer <- round(kmer * (window_size - k + 1))
     # begin by truncating outliers (probable HGT events)
@@ -105,12 +105,13 @@ onf.mode <- lapply(onf.data, function(onf) {
     return(dpois(kmer, kmer.lambda, log = TRUE))
   })
   onf.loglik <- rowSums(kmer.loglik)
+  onf.rankdist <- rank(-onf.loglik) / nrow(onf)
   
-  # Compute a weighted average of sliding window ONFs, where weights increase
-  # logistically with log-likelihood (inflection point @ 1st quartile)
-  onf.weight <- 1 / (1 + exp(1/k * (quantile(onf.loglik, 0.25) - onf.loglik)))
-  # experimentally, I think that 1 / kmer length (k) is a good scale coefficient
-  # but this might need to be tuned in the future
+  # Compute a weighted average of sliding window ONFs, where weights decrease
+  # logistically with rank distance (inflection point @ 80th percentile)
+  onf.weight <- 1 / (1 + exp(80 * (onf.rankdist - 0.8)))
+  # experimentally, I think that 80 is a good scale coefficient but this might
+  # need to be tuned in the future
   
   return(colSums(onf * onf.weight) / sum(onf.weight))
 })
