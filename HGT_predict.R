@@ -148,11 +148,15 @@ par.norm <- lapply(pca.dist, function(dist) {
   # estimate SD using Median Absolute Deviation to the left of the mode
   mad.left <- mad(dist[dist <= dist.mode], center = dist.mode)
   return(list(mean = dist.mode, sd = mad.left))
-}, )
+})
 
 # Gaussian mixture modeling: this is an unimplemented idea for parametrizing the
 # normal distribution of non-HGT sliding windows from a previous version
 # gmm.list <- lapply(pca.dist, mclust::Mclust, G = 1:2, verbose = FALSE)
+# par.norm <- lapply(gmm.list, function(gmm) {
+#   return(list(mean = gmm$parameters$mean[1],
+#               sd = sqrt(gmm$parameters$variance$sigmasq[1])))
+# })
 
 
 #### Figures ####
@@ -269,7 +273,7 @@ hgt.list <-
   }
 
 # Discard empty elements of hgt.list (i.e. no HGT predicted)
-hgt.list <- hgt.list[!sapply(hgt.list, is.null)]
+hgt.list <- hgt.list[sapply(hgt.list, nrow) > 0]
 
 if (length(hgt.list) == 0) {
   cat("Zero HGT candidates were detected.\n")
