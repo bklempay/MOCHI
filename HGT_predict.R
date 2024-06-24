@@ -2,16 +2,22 @@
 
 library(ape)
 library(stringi)
+library(robustbase)
+library(vegan)
 
 #### Default options ####
 
 outdir <- "."         # output file directory
 prefix <- "mochi"     # output file prefix
 mode <- "sensitive"   # conservative, sensitive, or ultrasensitive
-reference <- NULL     # compare input to a reference distribution [ONF matrix]
+reference <- NULL     # compare input to a reference genome [ONF matrix]
+nmds_dims <- 4        # number of NMDS dimensions
+mcd_alpha <- 0.5      # MCD subset size parameter (between 0.5 and 1)
 hgt_pval <- 0.001     # p-value cutoff for predicting HGT
 grp_bins <- TRUE      # genomes/MAGs -> TRUE; unbinned contigs -> FALSE
 one_fasta <- TRUE     # output one single FASTA, or one per input (meta)genome?
+rand_seed <- 4444     # set random seed for reproducibility of NMDS and MCD
+nthreads <- if (require(parallel, quietly = TRUE)) detectCores() else 1
 
 
 #### Command line arguments ####
@@ -65,10 +71,6 @@ file <- file[1]
 
 # Read ONF matrix (preferably degenerated)
 onf.matrix <- readRDS(file)
-# Get kmer/sliding window parameters
-k <- attributes(onf.matrix)$k
-window_size <- attributes(onf.matrix)$window_size
-window_step <- attributes(onf.matrix)$window_step
 
 # Extract sequence file paths and contig names from row names
 paths <- stri_match(rownames(onf.matrix), regex = "path:'(.*)'_contig")[, 2]
@@ -76,127 +78,107 @@ contigs <- stri_match(rownames(onf.matrix), regex = "contig:'(.*)'_start")[, 2]
 
 # Group sliding windows by genome/MAG or by contig depending on analysis mode:
 # each group is expected to share a null (non-HGT) ONF distribution
-onf.list <- split(data.frame(onf.matrix),
-                  f = if (grp_bins) paths else list(paths, contigs),
-                  drop = TRUE,
-                  sep = ">")
+group.by <-
+  if (grp_bins) {
+    as.factor(paths)
+  } else {
+    interaction(paths, contigs, drop = TRUE, sep = ">")
+  }
+group.by <- factor(group.by, levels = unique(group.by))
+onf.list <- split(data.frame(onf.matrix), group.by)
+
+# Read reference ONF matrix if provided (assumed to be a single genome)
+if (!is.null(reference)) onf.ref <- readRDS(reference)
 
 # Use query ONF matrix as training data for the null ONF distribution
-# else (if provided) get reference ONF matrix (assumed to be a single genome)
-onf.data <- if (is.null(reference)) onf.list else list(readRDS(reference))
+# else (if provided) append query to reference ONF matrix
+onf.data <- 
+  if (is.null(reference)) {
+    onf.list
+  } else {
+    stopifnot(!any(rownames(onf.ref) %in% rownames(query)))
+    # you really shouldn't use a genome as a reference for itself, but if you
+    # absolutely had to, you could just alter the reference ONF matrix row names
+    lapply(onf.list, function(query) rbind(onf.ref, query))
+  }
 
-#### Model the ONF distribution of non-HGT sliding windows ####
 
-# High-dimensional ONF mode estimation
-onf.mode <- lapply(onf.data, function(onf) {
-  # kmer counts can be modeled as a Poisson distribution, though the tails will
-  # be slightly fatter due to non-independence of overlapping sliding windows.
-  # Determine the log-likelihood of each sliding window as if the true null ONF
-  # distribution were the composite of independent, Poisson-distributed kmers
-  # (not the case, but it's a good way to rank distance from the ONF mode).
-  kmer.loglik <- apply(onf, 2, function(kmer) {
-    kmer <- round(kmer * (window_size - k + 1))
-    # begin by truncating outliers (probable HGT events)
-    kmer.sub <- kmer[kmer >= qpois(0.001, mean(kmer))] # use hgt_pval here?
-    kmer.sub <- kmer.sub[kmer.sub <= qpois(0.999, mean(kmer))]
-    # fit a new Poisson distribution to the truncated data
-    kmer.lambda <- mean(kmer.sub) # no need to do anything fancy!
-    # return the log-likelihood for each kmer
-    return(dpois(kmer, kmer.lambda, log = TRUE))
-  })
-  onf.loglik <- rowSums(kmer.loglik)
-  onf.rankdist <- rank(-onf.loglik) / nrow(onf)
-  
-  # Compute a weighted average of sliding window ONFs, where weights decrease
-  # logistically with rank distance (inflection point @ 80th percentile)
-  onf.weight <- 1 / (1 + exp(80 * (onf.rankdist - 0.8)))
-  # experimentally, I think that 80 is a good scale coefficient but this might
-  # need to be tuned in the future
-  
-  return(colSums(onf * onf.weight) / sum(onf.weight))
+#### Dimension reduction with NMDS ####
+
+cat("Reducing ONF dimensions... (this might take a while)\n")
+
+if (rand_seed) set.seed(rand_seed)
+
+# Non-metric multidimensional scaling
+nmds.list <- lapply(onf.data, metaMDS,
+                    distance = "euclidean",
+                    k = nmds_dims,
+                    autotransform = FALSE,
+                    trace = FALSE,
+                    parallel = nthreads)
+
+# Use full NMDS coordinates to estimate the null ONF distribution
+# else (if provided) use only the reference data points
+nmds.null <- 
+  if (is.null(reference)) {
+    lapply(nmds.list, function(nmds) return(nmds$points))
+  } else {
+    lapply(nmds.list, function(nmds) return(nmds$points[1:nrow(onf.ref), ]))
+  }
+
+
+#### Parameterize null ONF distribution in NMDS space ####
+
+cat("Parameterizing ONF distribution...\n")
+
+# Estimate center and spread using Minimum Covariance Determinant
+mcd.list <- lapply(nmds.null, function(nmds) {
+  covMcd(nmds, alpha = mcd_alpha)
 })
 
-# PCA ordination in order to reduce correlation between dimensions in ONF space
-pca.list <- mapply(prcomp, x = onf.data, center = onf.mode, SIMPLIFY = FALSE)
-# Overlapping kmers, e.g. ATCA and TCAA, are strongly correlated with each other
-# (assume linear correlations). Manhattan distance in ONF space therefore double
-# counts the influence of such kmers. PCA effectively weights each dimension in
-# order to reduce double counting, while preserving distances between points.
-
-# Calculate scaled-PCA Manhattan distances of sliding windows to the ONF mode
-# i.e. Manhattan distances from the origin in scaled PCA ordination space
-pca.dist <- lapply(pca.list, function(pca) {
-  pca.scale <- sweep(pca$x, 2, pca$sdev, "/")
-  return(rowSums(abs(pca.scale)))
-})
-
-# Thanks to the Central Limit Theorem, the scaled-PCA Manhattan distances of
-# non-HGT sliding windows should be normally distributed. HGT events will have
-# a greater distance from the ONF mode, so the combined distributions of non-HGT
-# and HGT sliding windows should be slightly right-skewed (depending on the rate
-# of HGT). The most parsimonious way to parametrize the distribution of non-HGT
-# sliding windows is to fit a normal distribution using only the left half of
-# the combined distribution. This method assumes that all sliding windows in the
-# left half of the combined distribution are non-HGT events.
-
-# Estimate normal distribution parameters for non-HGT sliding windows
-par.norm <- lapply(pca.dist, function(dist) {
-  # 2 * median - mean is a simple and effective heuristic for estimating the
-  # center (mode) of the non-HGT normal distribution, but this can (and should)
-  # be verified visually by looking at mochi_figures.pdf
-  dist.mode <- 2 * median(dist) - mean(dist)
-  # estimate SD using Median Absolute Deviation to the left of the mode
-  mad.left <- mad(dist[dist <= dist.mode], center = dist.mode)
-  return(list(mean = dist.mode, sd = mad.left))
-})
-
-# Gaussian mixture modeling: this is an unimplemented idea for parametrizing the
-# normal distribution of non-HGT sliding windows from a previous version
-# gmm.list <- lapply(pca.dist, mclust::Mclust, G = 1:2, verbose = FALSE)
-# par.norm <- lapply(gmm.list, function(gmm) {
-#   return(list(mean = gmm$parameters$mean[1],
-#               sd = sqrt(gmm$parameters$variance$sigmasq[1])))
-# })
-
-
-#### Figures ####
-
-pdf(paste0(prefix, "_figures.pdf"), width = 6, height = 6)
-
-for (i in 1:length(pca.dist)) {
-  hist(pca.dist[[i]], breaks = 50, freq = FALSE,
-       main = basename(names(pca.dist)[i]),
-       xlab = "Sliding window distance from ONF mode")
-  curve(dnorm(x, par.norm[[i]]$mean, par.norm[[i]]$sd), add = TRUE)
-  abline(v = qnorm(1 - hgt_pval, par.norm[[i]]$mean, par.norm[[i]]$sd),
-         lty = "dashed")
-}
-
-dev.off()
+# Calculate squared Mahalanobis distances of query data points
+mah.list <- 
+  if (is.null(reference)) {
+    lapply(mcd.list, function(mcd) return(mcd$mah))
+  } else {
+    mapply(
+      function(nmds, mcd) {
+        query <- nmds$points[-(1:nrow(onf.ref)), ]
+        return(mahalanobis(query, mcd$center, mcd$cov))
+      },
+      nmds = nmds.list,
+      mcd = mcd.list,
+      SIMPLIFY = FALSE
+    )
+  }
 
 
 #### Predict candidate HGT events ####
 
-hgt.pred <- function(pca, par, newdata = NULL) {
-  # Convert new sliding windows to PCA ordination space (if required)
-  pca.data <- if (!is.null(newdata)) predict(pca, newdata) else pca$x
-  pca.dist <- rowSums(abs(sweep(pca.data, 2, pca$sdev, "/")))
-  
+cat("Predicting candidate HGT events...\n")
+
+hgt.list <- lapply(mah.list, function(mah) {
   # Parse sliding window names
   windows <- data.frame(
-    stri_match(str = rownames(pca.data),
+    stri_match(str = names(mah),
                regex = "^path:'(.*)'_contig:'(.*)'_start:(\\d+)_end:(\\d+)$")
   )
   names(windows) <- c("name", "path", "contig", "start", "end")
-  # convert start and end positions to integers
-  windows <- type.convert(windows, as.is = TRUE)
+  # convert contigs to factor and start/end positions to integers
+  windows <- type.convert(windows, as.is = FALSE)
+  windows$contig <- factor(windows$contig, levels = unique(windows$contig))
+  # there should only be one level in windows$path
+  # if this is not the case, something went very wrong somewhere along the way
   
+  windows$mah <- mah
   # Calculate p-value for each sliding window
-  windows$pval <- pnorm(pca.dist, par$mean, par$sd, lower.tail = FALSE)
+  windows$pval <- pchisq(mah, nmds_dims, lower.tail = FALSE)
   
-  # Break sliding windows into chunks the length of window_step
   windows <- split(windows, ~ contig)
+  # Break sliding windows into chunks the length of window_step
   chunks <- lapply(windows, function(window) {
+    window_step <- unique(window$start[-1] - window$start[-nrow(window)])
+    # same as above, there should really only be one unique step size
     starts <- seq(min(window$start), max(window$end), window_step)
     ends <- starts + window_step - 1
     ends[length(ends)] <- max(window$end)
@@ -212,7 +194,9 @@ hgt.pred <- function(pca, par, newdata = NULL) {
       # get indices for sliding windows which overlap with each chunk
       which.windows <- mapply(
         function(start, end) {
-          return(which(window$start < end & window$end > start))
+          return(which(window$start <= start & window$end >= end))
+          # consider including partially overlapping windows in the future
+          # for now, I recommend making window_size a multiple of window_step
         },
         start = chunk$start,
         end = chunk$end
@@ -222,14 +206,14 @@ hgt.pred <- function(pca, par, newdata = NULL) {
       chunk$pval <- sapply(which.windows, function(ind) {
         switch(mode,
                # ultraconservative mode: maximum of sliding window p-values
-               ultraconservative = max(window[ind, "pval"]),
-               # conservative mode: arithmetic mean of sliding window distances
-               conservative = pnorm(mean(pca.dist[ind]), par$mean, par$sd,
-                                    lower.tail = FALSE),
+               ultraconservative = max(window$pval[ind]),
+               # conservative mode: arithmetic mean of mahalanobis distances
+               conservative = pchisq(mean(sqrt(window$mah[ind]))^2, nmds_dims,
+                                     lower.tail = FALSE),
                # sensitive mode: geometric mean of sliding window p-values
-               sensitive = exp(mean(log(window[ind, "pval"]))),
+               sensitive = exp(mean(log(window$pval[ind]))),
                # ultrasensitive mode: minimum of sliding window p-values
-               ultrasensitive = min(window[ind, "pval"]))
+               ultrasensitive = min(window$pval[ind]))
       })
       return(chunk[chunk$pval < hgt_pval, ])
     },
@@ -263,14 +247,7 @@ hgt.pred <- function(pca, par, newdata = NULL) {
   
   # Return merged HGT predictions
   return(do.call(rbind, hgt.merge))
-}
-
-hgt.list <- 
-  if (is.null(reference)) {
-    mapply(hgt.pred, pca = pca.list, par = par.norm, SIMPLIFY = FALSE)
-  } else {
-    lapply(onf.list, hgt.pred, pca = pca.list[[1]], par = par.norm[[1]])
-  }
+})
 
 # Discard empty elements of hgt.list (i.e. no HGT predicted)
 hgt.list <- hgt.list[sapply(hgt.list, nrow) > 0]
@@ -292,7 +269,7 @@ write.table(do.call(rbind, hgt.list), paste0(prefix, "_HGT_pred.tsv"),
 # Extract candidate HGT sequences
 hgt.seqs <- lapply(hgt.list, function(preds) {
   # read sequence file (fasta format)
-  fasta <- ape::read.FASTA(unique(preds$path))
+  fasta <- ape::read.FASTA(levels(preds$path))
   # subset candidate HGT sequences
   fasta.sub <- mapply(
     function(contig, start, end) {
@@ -326,3 +303,48 @@ if (one_fasta) {
     ape::write.FASTA(hgt.seqs, paste0(outdir, "/", name, "_HGT_pred.fasta"))
   }))
 }
+
+
+#### Figures ####
+
+# Define mochi-themed color palette
+palette.pval <- function(x) {
+  ind <- round(x * 99 + 1)
+  ramp <- colorRampPalette(c("#F8F8E0", "#672422")) # 小豆色 red bean color
+  return(ramp(100)[ind])
+}
+
+pdf(paste0(prefix, "_figures.pdf"), width = 6, height = 6)
+
+for (i in 1:length(nmds.list)) {
+  # Plot the first 2 NDMS dimensions
+  plot(
+    if (is.null(reference)) {
+      nmds.list[[i]]$points
+    } else {
+      nmds.list[[i]]$points[-(1:nrow(onf.ref)), ] # only the query data points
+    },
+    col = "#000000A0",
+    bg = palette.pval(pchisq(mah.list[[i]], nmds_dims, lower.tail = FALSE)),
+    pch = 21,
+    main = gsub("^.*/|\\.(fasta|fas|fa|fna|ffn)(\\.gz)?$", "",
+                basename(names(nmds.list)[i]))
+  )
+  mtext(paste0("NMDS: k = ",  nmds_dims,", stress = ",
+               round(nmds.list[[i]]$stress, 3)))
+  
+  # Add contours for Mahalanobis distances at which p = 0.05, 0.01, and 0.001
+  grid <- expand.grid(seq(par("usr")[1], par("usr")[2], length.out = 100),
+                      seq(par("usr")[3], par("usr")[4], length.out = 100))
+  for (j in which(1:nmds_dims > 2)) grid[, j] <- mcd.list[[i]]$center[j]
+  grid$mah <- mahalanobis(grid, mcd.list[[i]]$center, mcd.list[[i]]$cov)
+  grid$pval <- pchisq(grid$mah, df = nmds_dims, lower.tail = FALSE)
+  
+  contour(unique(grid$Var1), unique(grid$Var2),
+          z = matrix(grid$pval, 100, 100),
+          levels = c(0.05, 0.01, 0.001),
+          add = TRUE,
+          lty = "dashed")
+}
+
+dev.off()
