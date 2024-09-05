@@ -9,9 +9,10 @@ outdir <- "."         # output file directory
 prefix <- "mochi"     # output file prefix
 format <- "rds"       # output file format ["rds"|"tsv"]
 k <- 4                # kmer length
-window_size <- 5000   # sliding window dimensions (to bypass sliding windows,
+window_size <- 3000   # sliding window dimensions (to bypass sliding windows,
 window_step <- 1000   # make the window and step sizes arbitrarily large)
 rm_plasmids <- FALSE  # exclude plasmids due to uncharacteristic ONFs?
+trim_bp <- FALSE      # trim head and tail of each contig? [integer]
 cat_contigs <- FALSE  # concatenate contigs into a single, long sequence?
 min_length <- TRUE    # minimum contig length? (default 0.9 * window_size)
 subsample <- FALSE    # subsample sliding windows? [integer]
@@ -33,7 +34,7 @@ for (arg in input) {
     arg <- unlist(strsplit(arg, "="))
     # flag invalid variable names
     if (!(arg[1] %in% ls())) {
-      stop("invalid command line argument (", arg[1], ")")
+      stop("invalid command line argument \"", arg[1], "\"")
     }
     # assign value to variable name
     assign(arg[1], arg[2])
@@ -94,6 +95,14 @@ for (i in 1:length(files)) {
   if (rm_plasmids) {
     fasta <- fasta[!grepl("plasmid", names(fasta), ignore.case = TRUE)]
   }
+  # trim head and tail of each contig
+  if (trim_bp) {
+    fasta <- sapply(fasta, function(contig) {
+      contig <- contig[-(1:trim_bp)]
+      contig <- contig[-((length(contig) - trim_bp + 1):length(contig))]
+      return(na.omit(contig))
+    })
+  }
   # collapse DNA bases into long character strings
   fasta.cat <- sapply(fasta, paste, collapse = "")
   # concatenate contigs into a single, long string (optional)
@@ -112,6 +121,7 @@ for (i in 1:length(files)) {
     # determine the start and end positions for each window
     window.pos <- list(start = (1:n.window - 1) * window_step + 1,
                        end = (1:n.window - 1) * window_step + window_size)
+    window.pos$end[n.window] <- min(window.pos$end[n.window], nchar(contig))
     # trim each contig from start position to end position
     windows <- mapply(substr,
                       x = contig,
