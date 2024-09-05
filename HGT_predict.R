@@ -7,17 +7,17 @@ library(vegan)
 
 #### Default options ####
 
-outdir <- "."         # output file directory
-prefix <- "mochi"     # output file prefix
-mode <- "sensitive"   # conservative, sensitive, or ultrasensitive
-reference <- NULL     # compare input to a reference genome [ONF matrix]
-nmds_dims <- 4        # number of NMDS dimensions
-mcd_alpha <- 0.5      # MCD subset size parameter (between 0.5 and 1)
-hgt_pval <- 0.001     # p-value cutoff for predicting HGT
-grp_bins <- TRUE      # genomes/MAGs -> TRUE; unbinned contigs -> FALSE
-one_fasta <- TRUE     # output one single FASTA, or one per input (meta)genome?
-rand_seed <- 4444     # set random seed for reproducibility of NMDS and MCD
-nthreads <- if (require(parallel, quietly = TRUE)) detectCores() else 1
+outdir <- "."           # output file directory
+prefix <- "mochi"       # output file prefix
+method <- "nmds"        # ordination method ["nmds"|"pcoa"|"pca"]
+ndims <- 9              # number of ordination dimensions
+distance <- "euclidean" # dissimilarity index (NMDS and PCoA only)
+mcd_alpha <- 0.5        # MCD subset size parameter (between 0.5 and 1)
+hgt_pval <- 0.001       # p-value cutoff for predicting HGT
+grp_bins <- TRUE        # genomes/MAGs -> TRUE; unbinned contigs -> FALSE
+one_fasta <- TRUE       # output one single FASTA, or one per input genome/MAG
+rand_seed <- 4444       # set random seed for reproducibility of NMDS and MCD
+reference <- NULL
 
 
 #### Command line arguments ####
@@ -35,7 +35,7 @@ for (arg in input) {
     arg <- unlist(strsplit(arg, "="))
     # flag invalid variable names
     if (!(arg[1] %in% ls())) {
-      stop("invalid command line argument (", arg[1], ")")
+      stop("invalid command line argument \"", arg[1], "\"")
     }
     # assign value to variable name
     assign(arg[1], arg[2])
@@ -87,69 +87,61 @@ group.by <-
 group.by <- factor(group.by, levels = unique(group.by))
 onf.list <- split(data.frame(onf.matrix), group.by)
 
-# Read reference ONF matrix if provided (assumed to be a single genome)
-if (!is.null(reference)) onf.ref <- readRDS(reference)
 
-# Use query ONF matrix as training data for the null ONF distribution
-# else (if provided) append query to reference ONF matrix
-onf.data <- 
-  if (is.null(reference)) {
-    onf.list
-  } else {
-    stopifnot(!any(rownames(onf.ref) %in% rownames(query)))
-    # you really shouldn't use a genome as a reference for itself, but if you
-    # absolutely had to, you could just alter the reference ONF matrix row names
-    lapply(onf.list, function(query) rbind(onf.ref, query))
-  }
-
-
-#### Dimension reduction with NMDS ####
+#### Reduce ONF dimensionality ####
 
 cat("Reducing ONF dimensions... (this might take a while)\n")
 
 if (rand_seed) set.seed(rand_seed)
 
-# Non-metric multidimensional scaling
-nmds.list <- lapply(onf.data, metaMDS,
-                    distance = "euclidean",
-                    k = nmds_dims,
-                    autotransform = FALSE,
-                    trace = FALSE,
-                    parallel = nthreads)
+# Perform chosen ordination method
+onf.reduce <- lapply(
+  # use reference ONF matrix if provided
+  X = if (is.null(reference)) onf.list else list(readRDS(reference)),
+  FUN = function(onf) switch(
+    tolower(method),
+    nmds = metaMDS(onf,
+                   distance = distance,
+                   k = ndims,
+                   autotransform = FALSE,
+                   trace = FALSE),
+    pcoa = cmdscale(vegdist(onf, method = distance),
+                    k = ndims,
+                    list. = TRUE),
+    pca = prcomp(onf, rank. = ndims)
+  )
+)
 
-# Use full NMDS coordinates to estimate the null ONF distribution
-# else (if provided) use only the reference data points
-nmds.null <- 
-  if (is.null(reference)) {
-    lapply(nmds.list, function(nmds) return(nmds$points))
+# Extract sliding window coordinates in lower-dimensional ordination space
+onf.scores <-
+  if (method == "pca") {
+    lapply(onf.reduce, function(pca) return(pca$x))
   } else {
-    lapply(nmds.list, function(nmds) return(nmds$points[1:nrow(onf.ref), ]))
+    lapply(onf.reduce, function(mds) return(mds$points))
   }
 
 
-#### Parameterize null ONF distribution in NMDS space ####
+#### Parameterize null ONF distribution in ordination space ####
 
 cat("Parameterizing ONF distribution...\n")
 
 # Estimate center and spread using Minimum Covariance Determinant
-mcd.list <- lapply(nmds.null, function(nmds) {
-  covMcd(nmds, alpha = mcd_alpha)
+mcd.list <- lapply(onf.scores, function(scores) {
+  covMcd(scores, alpha = mcd_alpha)
 })
 
-# Calculate squared Mahalanobis distances of query data points
-mah.list <- 
+# Calculate squared Mahalanobis distances
+mah.list <-
   if (is.null(reference)) {
     lapply(mcd.list, function(mcd) return(mcd$mah))
   } else {
-    mapply(
-      function(nmds, mcd) {
-        query <- nmds$points[-(1:nrow(onf.ref)), ]
-        return(mahalanobis(query, mcd$center, mcd$cov))
-      },
-      nmds = nmds.list,
-      mcd = mcd.list,
-      SIMPLIFY = FALSE
-    )
+    # if a reference was used for the ordination, first project query sliding
+    # windows into the reference ordination space...
+    lapply(onf.list, function(query) {
+      query.pca <- predict(onf.reduce[[1]], query)
+      # then calculate Mahalanobis distances to the reference distribution
+      return(mahalanobis(query.pca, mcd.list[[1]]$center, mcd.list[[1]]$cov))
+    })
   }
 
 
@@ -172,12 +164,12 @@ hgt.list <- lapply(mah.list, function(mah) {
   
   windows$mah <- mah
   # Calculate p-value for each sliding window
-  windows$pval <- pchisq(mah, nmds_dims, lower.tail = FALSE)
+  windows$pval <- pchisq(mah, ndims, lower.tail = FALSE)
   
   windows <- split(windows, ~ contig)
   # Break sliding windows into chunks the length of window_step
   chunks <- lapply(windows, function(window) {
-    window_step <- unique(window$start[-1] - window$start[-nrow(window)])
+    # window_step <- unique(window$start[-1] - window$start[-nrow(window)])
     # same as above, there should really only be one unique step size
     starts <- seq(min(window$start), max(window$end), window_step)
     ends <- starts + window_step - 1
@@ -188,7 +180,7 @@ hgt.list <- lapply(mah.list, function(mah) {
                       end = ends))
   })
   
-  # Predict candidate HGT events (p < hgt_pval)
+  # Predict candidate HGT events
   hgt.preds <- mapply(
     function(chunk, window) {
       # get indices for sliding windows which overlap with each chunk
@@ -202,19 +194,11 @@ hgt.list <- lapply(mah.list, function(mah) {
         end = chunk$end
       )
       
-      # Calculate p-value for each chunk
+      # Give each chunk the p-value of its central sliding window
       chunk$pval <- sapply(which.windows, function(ind) {
-        switch(mode,
-               # ultraconservative mode: maximum of sliding window p-values
-               ultraconservative = max(window$pval[ind]),
-               # conservative mode: arithmetic mean of mahalanobis distances
-               conservative = pchisq(mean(sqrt(window$mah[ind]))^2, nmds_dims,
-                                     lower.tail = FALSE),
-               # sensitive mode: geometric mean of sliding window p-values
-               sensitive = exp(mean(log(window$pval[ind]))),
-               # ultrasensitive mode: minimum of sliding window p-values
-               ultrasensitive = min(window$pval[ind]))
+        return(window$pval[round(median(ind))])
       })
+      # return the chunks for which p < hgt_pval
       return(chunk[chunk$pval < hgt_pval, ])
     },
     chunk = chunks,
@@ -258,7 +242,7 @@ if (length(hgt.list) == 0) {
 }
 
 # Output HGT predictions matrix
-write.table(do.call(rbind, hgt.list), paste0(prefix, "_HGT_pred.tsv"),
+write.table(do.call(rbind, hgt.list), paste0(prefix, "_HGT_preds.tsv"),
             sep = "\t",
             quote = FALSE,
             row.names = FALSE)
@@ -287,20 +271,21 @@ hgt.seqs <- lapply(hgt.list, function(preds) {
 })
 
 # Output FASTA file(s)
+names(hgt.seqs) <- NULL # keep only sub-list names
+hgt.seqs <- unlist(hgt.seqs, recursive = FALSE)
+class(hgt.seqs) <- "DNAbin"
+
 if (one_fasta) {
   # either one single FASTA (default)
-  hgt.seqs <- unlist(hgt.seqs, recursive = FALSE)
-  class(hgt.seqs) <- "DNAbin"
-  ape::write.FASTA(hgt.seqs, paste0(prefix, "_HGT_pred.fasta"))
+  ape::write.FASTA(hgt.seqs, paste0(prefix, "_HGT_preds.fasta"))
 } else {
   # or one per input (meta)genome
   invisible(sapply(unique(paths), function(path) {
     is.query <- grepl(path, names(hgt.seqs))
-    hgt.seqs <- unlist(hgt.seqs[is.query], recursive = FALSE)
-    class(hgt.seqs) <- "DNAbin"
     # truncate directory name and file extension from (meta)genome path
     name <- gsub("^.*/|\\.(fasta|fas|fa|fna|ffn)(\\.gz)?$", "", path)
-    ape::write.FASTA(hgt.seqs, paste0(outdir, "/", name, "_HGT_pred.fasta"))
+    ape::write.FASTA(hgt.seqs[is.query],
+                     paste0(outdir, "/", name, "_HGT_preds.fasta"))
   }))
 }
 
@@ -316,29 +301,29 @@ palette.pval <- function(x) {
 
 pdf(paste0(prefix, "_figures.pdf"), width = 6, height = 6)
 
-for (i in 1:length(nmds.list)) {
-  # Plot the first 2 NDMS dimensions
+for (i in 1:length(onf.scores)) {
+  # Plot the first 2 ordination dimensions
   plot(
-    if (is.null(reference)) {
-      nmds.list[[i]]$points
-    } else {
-      nmds.list[[i]]$points[-(1:nrow(onf.ref)), ] # only the query data points
-    },
+    onf.scores[[i]][, 1:ndims],
     col = "#000000A0",
-    bg = palette.pval(pchisq(mah.list[[i]], nmds_dims, lower.tail = FALSE)),
+    bg = palette.pval(pchisq(mah.list[[i]], ndims, lower.tail = FALSE)),
     pch = 21,
     main = gsub("^.*/|\\.(fasta|fas|fa|fna|ffn)(\\.gz)?$", "",
-                basename(names(nmds.list)[i]))
+                names(onf.scores)[i])
   )
-  mtext(paste0("NMDS: k = ",  nmds_dims,", stress = ",
-               round(nmds.list[[i]]$stress, 3)))
+  mtext(switch(tolower(method),
+               nmds = bquote(NMDS: ~ italic(N) ~ "=" ~ .(ndims) * ", stress =" ~
+                               .(round(onf.reduce[[i]]$stress, 3))),
+               pcoa = bquote(PCoA: ~ italic(N) ~ "=" ~ .(ndims)),
+               pca = bquote(PCA: ~ italic(N) ~ "=" ~ .(ndims))
+  ))
   
   # Add contours for Mahalanobis distances at which p = 0.05, 0.01, and 0.001
   grid <- expand.grid(seq(par("usr")[1], par("usr")[2], length.out = 100),
                       seq(par("usr")[3], par("usr")[4], length.out = 100))
-  for (j in which(1:nmds_dims > 2)) grid[, j] <- mcd.list[[i]]$center[j]
+  for (j in which(1:ndims > 2)) grid[, j] <- mcd.list[[i]]$center[j]
   grid$mah <- mahalanobis(grid, mcd.list[[i]]$center, mcd.list[[i]]$cov)
-  grid$pval <- pchisq(grid$mah, df = nmds_dims, lower.tail = FALSE)
+  grid$pval <- pchisq(grid$mah, df = ndims, lower.tail = FALSE)
   
   contour(unique(grid$Var1), unique(grid$Var2),
           z = matrix(grid$pval, 100, 100),
