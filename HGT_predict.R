@@ -78,12 +78,7 @@ contigs <- stri_match(rownames(onf.matrix), regex = "contig:'(.*)'_start")[, 2]
 
 # Group sliding windows by genome/MAG or by contig depending on analysis mode:
 # each group is expected to share a null (non-HGT) ONF distribution
-group.by <-
-  if (grp_bins) {
-    as.factor(paths)
-  } else {
-    interaction(paths, contigs, drop = TRUE, sep = ">")
-  }
+group.by <- if (grp_bins) paths else paste0(paths, ">" , contigs)
 group.by <- factor(group.by, levels = unique(group.by))
 onf.list <- split(data.frame(onf.matrix), group.by)
 
@@ -113,7 +108,7 @@ onf.reduce <- lapply(
 )
 
 # Extract sliding window coordinates in lower-dimensional ordination space
-onf.scores <-
+onf.coord <-
   if (method == "pca") {
     lapply(onf.reduce, function(pca) return(pca$x))
   } else {
@@ -126,8 +121,8 @@ onf.scores <-
 cat("Parameterizing ONF distribution...\n")
 
 # Estimate center and spread using Minimum Covariance Determinant
-mcd.list <- lapply(onf.scores, function(scores) {
-  covMcd(scores, alpha = mcd_alpha)
+mcd.list <- lapply(onf.coord, function(coord) {
+  covMcd(coord, alpha = mcd_alpha)
 })
 
 # Calculate squared Mahalanobis distances
@@ -162,15 +157,18 @@ hgt.list <- lapply(mah.list, function(mah) {
   # there should only be one level in windows$path
   # if this is not the case, something went very wrong somewhere along the way
   
-  windows$mah <- mah
   # Calculate p-value for each sliding window
+  windows$mah <- mah
   windows$pval <- pchisq(mah, ndims, lower.tail = FALSE)
   
-  windows <- split(windows, ~ contig)
   # Break sliding windows into chunks the length of window_step
+  windows <- split(windows, ~ contig)
   chunks <- lapply(windows, function(window) {
-    # window_step <- unique(window$start[-1] - window$start[-nrow(window)])
-    # same as above, there should really only be one unique step size
+    window_step <-
+      if (nrow(window) > 1) {
+        unique(window$start[-1] - window$start[-nrow(window)])
+        # same as above, there should really only be one unique step size
+      } else window$end
     starts <- seq(min(window$start), max(window$end), window_step)
     ends <- starts + window_step - 1
     ends[length(ends)] <- max(window$end)
@@ -191,7 +189,8 @@ hgt.list <- lapply(mah.list, function(mah) {
           # for now, I recommend making window_size a multiple of window_step
         },
         start = chunk$start,
-        end = chunk$end
+        end = chunk$end,
+        SIMPLIFY = FALSE
       )
       
       # Give each chunk the p-value of its central sliding window
@@ -206,6 +205,9 @@ hgt.list <- lapply(mah.list, function(mah) {
     SIMPLIFY = FALSE
   )
   
+  # Discard empty elements of hgt.preds (i.e. no HGT predicted)
+  hgt.preds <- hgt.preds[sapply(hgt.preds, nrow) > 0]
+  
   # Merge contiguous chunks
   hgt.heads <- lapply(hgt.preds, function(preds) {
     return(which(c(preds$start, 0) > c(0, preds$end + 1)))
@@ -216,10 +218,11 @@ hgt.list <- lapply(mah.list, function(mah) {
   hgt.merge <- mapply(
     function(preds, heads, tails) {
       return(data.frame(
-        path = preds$path[heads],
-        contig = preds$contig[heads],
+        path = unique(preds$path),
+        contig = unique(preds$contig),
         start = preds$start[heads],
-        end = preds$end[tails]
+        end = preds$end[tails],
+        pval = exp(mean(log(preds$pval))) # geometric mean
       ))
     },
     preds = hgt.preds,
@@ -233,15 +236,15 @@ hgt.list <- lapply(mah.list, function(mah) {
   return(do.call(rbind, hgt.merge))
 })
 
-# Discard empty elements of hgt.list (i.e. no HGT predicted)
-hgt.list <- hgt.list[sapply(hgt.list, nrow) > 0]
+# Discard NULL elements of hgt.list (i.e. no HGT predicted)
+hgt.list <- hgt.list[!sapply(hgt.list, is.null)]
 
 if (length(hgt.list) == 0) {
   cat("Zero HGT candidates were detected.\n")
   quit(save = "no")
 }
 
-# Output HGT predictions matrix
+# Output HGT predictions table
 write.table(do.call(rbind, hgt.list), paste0(prefix, "_HGT_preds.tsv"),
             sep = "\t",
             quote = FALSE,
@@ -253,11 +256,11 @@ write.table(do.call(rbind, hgt.list), paste0(prefix, "_HGT_preds.tsv"),
 # Extract candidate HGT sequences
 hgt.seqs <- lapply(hgt.list, function(preds) {
   # read sequence file (fasta format)
-  fasta <- ape::read.FASTA(levels(preds$path))
+  fasta <- ape::read.FASTA(unique(preds$path))
   # subset candidate HGT sequences
   fasta.sub <- mapply(
     function(contig, start, end) {
-      return(fasta[[contig]][start:end])
+      return(fasta[[as.character(contig)]][start:end])
     },
     contig = preds$contig,
     start = preds$start,
@@ -301,15 +304,15 @@ palette.pval <- function(x) {
 
 pdf(paste0(prefix, "_figures.pdf"), width = 6, height = 6)
 
-for (i in 1:length(onf.scores)) {
+for (i in 1:length(onf.coord)) {
   # Plot the first 2 ordination dimensions
   plot(
-    onf.scores[[i]][, 1:ndims],
+    onf.coord[[i]][, 1:ndims],
     col = "#000000A0",
     bg = palette.pval(pchisq(mah.list[[i]], ndims, lower.tail = FALSE)),
     pch = 21,
     main = gsub("^.*/|\\.(fasta|fas|fa|fna|ffn)(\\.gz)?$", "",
-                names(onf.scores)[i])
+                names(onf.coord)[i])
   )
   mtext(switch(tolower(method),
                nmds = bquote(NMDS: ~ italic(N) ~ "=" ~ .(ndims) * ", stress =" ~
